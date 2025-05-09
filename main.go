@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/caarlos0/env/v11"
 	"github.com/charmbracelet/glamour"
@@ -45,6 +46,7 @@ var (
 	showLineNumbers  bool
 	preserveNewLines bool
 	mouse            bool
+	loaderStyle      string
 
 	rootCmd = &cobra.Command{
 		Use:   "glow [SOURCE|DIR]",
@@ -272,6 +274,97 @@ func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
 	return executeCLI(cmd, src, w)
 }
 
+// loaderType represents different styles of loading animations
+type loaderType int
+
+const (
+	loaderDots loaderType = iota
+	loaderBraille
+)
+
+// loader manages the animation state for loading indicators
+type loader struct {
+	loaderType loaderType
+	frames     []string
+	current    int
+	active     bool
+	lastUpdate time.Time
+	msgChan    chan struct{}
+	stopChan   chan struct{}
+}
+
+// newLoader creates a new loader with the specified type
+func newLoader(lt loaderType) *loader {
+	var frames []string
+
+	switch lt {
+	case loaderDots:
+		frames = []string{".", "..", "...", ""}
+	case loaderBraille:
+		frames = []string{
+			"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
+		}
+	}
+
+	return &loader{
+		loaderType: lt,
+		frames:     frames,
+		msgChan:    make(chan struct{}, 1),
+		stopChan:   make(chan struct{}),
+		lastUpdate: time.Now(),
+	}
+}
+
+// start begins the loader animation in a separate goroutine
+func (l *loader) start(w io.Writer) {
+	l.active = true
+
+	go func() {
+		ticker := time.NewTicker(40 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-l.stopChan:
+				// Clear the loader animation
+				fmt.Fprint(w, "\r\033[K")
+				return
+
+			case <-l.msgChan:
+				// Message received, reset animation timer
+				l.lastUpdate = time.Now()
+
+			case <-ticker.C:
+				// Only show loader if we've been waiting for a while (500ms)
+				if time.Since(l.lastUpdate) > 20*time.Millisecond {
+					l.current = (l.current + 1) % len(l.frames)
+					frame := l.frames[l.current]
+					fmt.Fprintf(w, "\r\033[K%s", frame) // Clear line and print frame
+				}
+			}
+		}
+	}()
+}
+
+// update signals that new data was received
+func (l *loader) update() {
+	if l.active {
+		// Non-blocking send to avoid hangs if channel is full
+		select {
+		case l.msgChan <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// stop terminates the loader animation
+func (l *loader) stop() {
+	if l.active {
+		l.active = false
+		close(l.stopChan)
+	}
+}
+
 // shouldRenderUpdate determines if we should re-render based on the current line
 // and content seen so far. This helps identify markdown elements that can change
 // the rendering of previous content.
@@ -333,6 +426,8 @@ func shouldRenderUpdate(currentLine string, previousLines []string) bool {
 }
 
 func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
+	useLoader := loaderStyle != "none"
+
 	// If not reading from stdin, just read all and render once
 	if _, ok := src.reader.(*os.File); !ok || src.reader != os.Stdin {
 		b, err := io.ReadAll(src.reader)
@@ -353,13 +448,14 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 	}
 
 	// For stdin from a pipe, we'll read incrementally and render as we go
-	return renderIncrementalFromStdin(cmd, src, w)
+	return renderIncrementalFromStdin(cmd, src, w, useLoader)
 }
 
 // renderIncrementalFromStdin reads incrementally from stdin and renders
 // the markdown as it becomes available
-func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer) error {
-	scanner := bufio.NewScanner(src.reader)
+func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, useLoader bool) error {
+	// Create a buffered reader with a 1-second timeout to detect pauses in input
+	reader := bufio.NewReader(src.reader)
 
 	// Buffer to accumulate content
 	var buffer bytes.Buffer
@@ -368,57 +464,149 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer) er
 	var r *glamour.TermRenderer
 	var err error
 
+	// Setup loader if enabled
+	var l *loader
+	if useLoader {
+		// Choose loader type based on terminal capabilities or user preference
+		var loaderType loaderType
+
+		switch loaderStyle {
+		case "dots":
+			loaderType = loaderDots
+		case "braille":
+			loaderType = loaderBraille
+		default:
+			loaderType = loaderBraille
+		}
+
+		// Fall back to dots if not writing to a terminal
+		if f, ok := w.(*os.File); !ok || !term.IsTerminal(int(f.Fd())) {
+			loaderType = loaderDots
+		}
+
+		// Create and start the loader
+		l = newLoader(loaderType)
+		l.start(w)
+		defer l.stop()
+	}
+
 	// Setup renderer once
 	if r, _, err = setupRenderer(src); err != nil {
 		return err
 	}
 
-	for scanner.Scan() {
-		// Get the new line
-		line := scanner.Text()
+	// Use a scanner for line-by-line reading
+	scanner := bufio.NewScanner(reader)
 
-		// Add the line to our accumulated content
-		buffer.WriteString(line)
-		buffer.WriteString("\n")
+	// Read timeout handling
+	lastActivity := time.Now()
+	inactivityTimeout := 500 * time.Millisecond
 
-		// Add to our line-by-line tracking
-		previousLines = append(previousLines, line)
+	// Channel to handle timeouts
+	timeoutChan := make(chan struct{})
 
-		// Only re-render periodically or when we detect certain markdown structures
-		// that might affect previous rendering
-		shouldRender := shouldRenderUpdate(line, previousLines)
+	go func() {
+		for {
+			// If we haven't received input for the timeout duration, send timeout signal
+			if time.Since(lastActivity) > inactivityTimeout {
+				timeoutChan <- struct{}{}
+				time.Sleep(100 * time.Millisecond) // Small sleep to prevent flooding
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
 
-		if shouldRender {
-			// Generate new full output
-			newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
-			if err != nil {
-				return err
+	for {
+		// Check if scanner has more data available
+		hasMore := scanner.Scan()
+		if hasMore {
+			// Update activity timestamp and loader
+			lastActivity = time.Now()
+			if l != nil {
+				l.update()
 			}
 
-			// If rendering drastically changed (can happen with reference links, footnotes, etc.)
-			if !strings.HasPrefix(newOutput, lastOutput) {
-				// Clear terminal and do a full re-render if the output doesn't just append
-				fmt.Fprint(w, "\033[2J\033[H")
-				if _, err = fmt.Fprint(w, newOutput); err != nil {
-					return fmt.Errorf("unable to write to writer: %w", err)
+			// Get the new line
+			line := scanner.Text()
+
+			// Add the line to our accumulated content
+			buffer.WriteString(line)
+			buffer.WriteString("\n")
+
+			// Add to our line-by-line tracking
+			previousLines = append(previousLines, line)
+
+			// Only re-render periodically or when we detect certain markdown structures
+			shouldRender := shouldRenderUpdate(line, previousLines)
+
+			if shouldRender {
+				// Generate new full output
+				newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
+				if err != nil {
+					return err
 				}
-			} else {
-				// Get only the new part of the rendered output
-				newContent := strings.TrimPrefix(newOutput, lastOutput)
-				if _, err = fmt.Fprint(w, newContent); err != nil {
-					return fmt.Errorf("unable to write to writer: %w", err)
+
+				// If rendering drastically changed
+				if !strings.HasPrefix(newOutput, lastOutput) {
+					// Clear terminal and do a full re-render
+					fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
+					fmt.Fprint(w, "\033[2J\033[H")
+					if _, err = fmt.Fprint(w, newOutput); err != nil {
+						return fmt.Errorf("unable to write to writer: %w", err)
+					}
+				} else {
+					// Get only the new part of the rendered output
+					newContent := strings.TrimPrefix(newOutput, lastOutput)
+					fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
+					if _, err = fmt.Fprint(w, newContent); err != nil {
+						return fmt.Errorf("unable to write to writer: %w", err)
+					}
+				}
+
+				lastOutput = newOutput
+			}
+		} else if err := scanner.Err(); err != nil {
+			return fmt.Errorf("error reading from stdin: %w", err)
+		} else {
+			// End of input
+			break
+		}
+
+		// Handle timeout - render what we have so far if we haven't received input for a while
+		select {
+		case <-timeoutChan:
+			// If we have content and haven't rendered recently, do a render
+			if buffer.Len() > 0 && time.Since(lastActivity) > inactivityTimeout {
+				newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
+				if err != nil {
+					return err
+				}
+
+				if newOutput != lastOutput {
+					if !strings.HasPrefix(newOutput, lastOutput) {
+						// Full re-render
+						fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
+						fmt.Fprint(w, "\033[2J\033[H")
+						if _, err = fmt.Fprint(w, newOutput); err != nil {
+							return fmt.Errorf("unable to write to writer: %w", err)
+						}
+					} else {
+						// Incremental update
+						newContent := strings.TrimPrefix(newOutput, lastOutput)
+						fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
+						if _, err = fmt.Fprint(w, newContent); err != nil {
+							return fmt.Errorf("unable to write to writer: %w", err)
+						}
+					}
+					lastOutput = newOutput
 				}
 			}
-
-			lastOutput = newOutput
+		default:
+			// Continue normally
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading from stdin: %w", err)
-	}
-
-	// Ensure final render happens if we stopped early due to periodic rendering
+	// Ensure final render happens
 	newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
 	if err != nil {
 		return err
@@ -427,6 +615,7 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer) er
 	if newOutput != lastOutput {
 		if !strings.HasPrefix(newOutput, lastOutput) {
 			// Full re-render
+			fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
 			fmt.Fprint(w, "\033[2J\033[H")
 			if _, err = fmt.Fprint(w, newOutput); err != nil {
 				return fmt.Errorf("unable to write to writer: %w", err)
@@ -434,6 +623,7 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer) er
 		} else {
 			// Incremental update
 			newContent := strings.TrimPrefix(newOutput, lastOutput)
+			fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
 			if _, err = fmt.Fprint(w, newContent); err != nil {
 				return fmt.Errorf("unable to write to writer: %w", err)
 			}
@@ -621,6 +811,7 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showLineNumbers, "line-numbers", "l", false, "show line numbers (TUI-mode only)")
 	rootCmd.Flags().BoolVarP(&preserveNewLines, "preserve-new-lines", "n", false, "preserve newlines in the output")
 	rootCmd.Flags().BoolVarP(&mouse, "mouse", "m", false, "enable mouse wheel (TUI-mode only)")
+	rootCmd.Flags().StringVar(&loaderStyle, "loader", "braille", "loading animation style: braille, dots, none")
 	_ = rootCmd.Flags().MarkHidden("mouse")
 
 	// Config bindings
@@ -633,10 +824,12 @@ func init() {
 	_ = viper.BindPFlag("preserveNewLines", rootCmd.Flags().Lookup("preserve-new-lines"))
 	_ = viper.BindPFlag("showLineNumbers", rootCmd.Flags().Lookup("line-numbers"))
 	_ = viper.BindPFlag("all", rootCmd.Flags().Lookup("all"))
+	_ = viper.BindPFlag("loader", rootCmd.Flags().Lookup("loader"))
 
 	viper.SetDefault("style", styles.AutoStyle)
 	viper.SetDefault("width", 0)
 	viper.SetDefault("all", true)
+	viper.SetDefault("loader", "braille")
 
 	rootCmd.AddCommand(configCmd, manCmd)
 }
