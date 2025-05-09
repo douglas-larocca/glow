@@ -106,7 +106,7 @@ func GlamourStyle(style string, isCode bool) glamour.TermRendererOption {
 		return glamour.WithStylesFromJSONFile(style)
 	}
 
-	var margin uint
+	var margin uint = 0
 	styleConfig.CodeBlock.Margin = &margin
 
 	return glamour.WithStyles(styleConfig)

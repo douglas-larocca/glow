@@ -14,16 +14,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/caarlos0/env/v11"
-	"github.com/charmbracelet/glamour"
-	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/glow/v2/ui"
 	"github.com/charmbracelet/glow/v2/utils"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/log"
+	"github.com/douglas-larocca/glamour"
+	"github.com/douglas-larocca/glamour/styles"
 	gap "github.com/muesli/go-app-paths"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -274,95 +275,87 @@ func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
 	return executeCLI(cmd, src, w)
 }
 
-// loaderType represents different styles of loading animations
-type loaderType int
-
-const (
-	loaderDots loaderType = iota
-	loaderBraille
-)
-
-// loader manages the animation state for loading indicators
-type loader struct {
-	loaderType loaderType
-	frames     []string
-	current    int
-	active     bool
-	lastUpdate time.Time
-	msgChan    chan struct{}
-	stopChan   chan struct{}
+// terminalPosition tracks the cursor position in the terminal
+type terminalPosition struct {
+	row    int
+	column int
 }
 
-// newLoader creates a new loader with the specified type
-func newLoader(lt loaderType) *loader {
-	var frames []string
-
-	switch lt {
-	case loaderDots:
-		frames = []string{".", "..", "...", ""}
-	case loaderBraille:
-		frames = []string{
-			"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-		}
+// getTerminalPosition gets the current terminal cursor position
+// This uses ANSI escape codes to query and parse the cursor position
+func getTerminalPosition(file *os.File) (terminalPosition, error) {
+	// This only works for terminals, so make sure we're dealing with one
+	if !term.IsTerminal(int(file.Fd())) {
+		return terminalPosition{}, fmt.Errorf("not a terminal")
 	}
 
-	return &loader{
-		loaderType: lt,
-		frames:     frames,
-		msgChan:    make(chan struct{}, 1),
-		stopChan:   make(chan struct{}),
-		lastUpdate: time.Now(),
+	// Save current terminal attributes to restore later
+	oldState, err := term.MakeRaw(int(file.Fd()))
+	if err != nil {
+		return terminalPosition{}, err
 	}
+	defer term.Restore(int(file.Fd()), oldState)
+
+	// Write the ANSI escape code to query the cursor position
+	// ESC [ 6 n
+	_, err = file.Write([]byte("\x1b[6n"))
+	if err != nil {
+		return terminalPosition{}, err
+	}
+
+	// Read the response: ESC [ rows ; cols R
+	var buf [32]byte
+	n, err := file.Read(buf[:])
+	if err != nil {
+		return terminalPosition{}, err
+	}
+
+	// Parse the response
+	response := string(buf[:n])
+	if !strings.HasPrefix(response, "\x1b[") || !strings.HasSuffix(response, "R") {
+		return terminalPosition{}, fmt.Errorf("invalid terminal response: %q", response)
+	}
+
+	// Extract the numbers from the response
+	response = response[2 : len(response)-1] // Remove ESC[ and R
+	parts := strings.Split(response, ";")
+	if len(parts) != 2 {
+		return terminalPosition{}, fmt.Errorf("invalid terminal response format: %q", response)
+	}
+
+	// Parse the numbers
+	row, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return terminalPosition{}, err
+	}
+	col, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return terminalPosition{}, err
+	}
+
+	return terminalPosition{row: row, column: col}, nil
 }
 
-// start begins the loader animation in a separate goroutine
-func (l *loader) start(w io.Writer) {
-	l.active = true
-
-	go func() {
-		ticker := time.NewTicker(40 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-l.stopChan:
-				// Clear the loader animation
-				fmt.Fprint(w, "\r\033[K")
-				return
-
-			case <-l.msgChan:
-				// Message received, reset animation timer
-				l.lastUpdate = time.Now()
-
-			case <-ticker.C:
-				// Only show loader if we've been waiting for a while (500ms)
-				if time.Since(l.lastUpdate) > 20*time.Millisecond {
-					l.current = (l.current + 1) % len(l.frames)
-					frame := l.frames[l.current]
-					fmt.Fprintf(w, "\r\033[K%s", frame) // Clear line and print frame
-				}
-			}
-		}
-	}()
+// moveTo generates ANSI escape code to position cursor at specific coordinates
+func (pos terminalPosition) moveTo() string {
+	return fmt.Sprintf("\x1b[%d;%dH", pos.row, pos.column)
 }
 
-// update signals that new data was received
-func (l *loader) update() {
-	if l.active {
-		// Non-blocking send to avoid hangs if channel is full
-		select {
-		case l.msgChan <- struct{}{}:
-		default:
-		}
+// saveTerminalPosition saves the current terminal position for later restoration
+func saveTerminalPosition(w io.Writer) (terminalPosition, error) {
+	// Try to get terminal position if we're writing to a terminal
+	f, ok := w.(*os.File)
+	if !ok {
+		return terminalPosition{}, fmt.Errorf("output is not a terminal")
 	}
-}
 
-// stop terminates the loader animation
-func (l *loader) stop() {
-	if l.active {
-		l.active = false
-		close(l.stopChan)
+	// Get current position
+	pos, err := getTerminalPosition(f)
+	if err != nil {
+		return terminalPosition{}, err
 	}
+
+	return pos, nil
 }
 
 // shouldRenderUpdate determines if we should re-render based on the current line
@@ -452,21 +445,38 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 }
 
 // renderIncrementalFromStdin reads incrementally from stdin and renders
-// the markdown as it becomes available
+// the markdown as it becomes available, using the alternate screen for progress
 func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, useLoader bool) error {
-	// Create a buffered reader with a 1-second timeout to detect pauses in input
+	// Create a terminal buffer manager
+	tb := newTermbuf(w)
+
+	// Enter alternate screen if we're on a terminal
+	if err := tb.enterAltScreen(); err != nil {
+		// If we can't use the alternate screen, continue without it
+		log.Debug("failed to enter alternate screen", "err", err)
+	}
+
+	// Make sure we always exit the alternate screen
+	defer func() {
+		if err := tb.exitAltScreen(); err != nil {
+			log.Debug("failed to exit alternate screen", "err", err)
+		}
+	}()
+
+	// Create a buffered reader
 	reader := bufio.NewReader(src.reader)
 
 	// Buffer to accumulate content
 	var buffer bytes.Buffer
 	var previousLines []string // Store individual lines for diffing
 	var lastOutput string      // Last output sent to terminal
+	var finalOutput string     // The final rendered output
 	var r *glamour.TermRenderer
 	var err error
 
-	// Setup loader if enabled
+	// Setup loader if enabled and we're in alternate screen
 	var l *loader
-	if useLoader {
+	if useLoader && tb.isActive {
 		// Choose loader type based on terminal capabilities or user preference
 		var loaderType loaderType
 
@@ -477,11 +487,6 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 			loaderType = loaderBraille
 		default:
 			loaderType = loaderBraille
-		}
-
-		// Fall back to dots if not writing to a terminal
-		if f, ok := w.(*os.File); !ok || !term.IsTerminal(int(f.Fd())) {
-			loaderType = loaderDots
 		}
 
 		// Create and start the loader
@@ -497,6 +502,7 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 
 	// Use a scanner for line-by-line reading
 	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024) // Increase buffer size for large lines
 
 	// Read timeout handling
 	lastActivity := time.Now()
@@ -516,6 +522,7 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 		}
 	}()
 
+	// Process incoming data
 	for {
 		// Check if scanner has more data available
 		hasMore := scanner.Scan()
@@ -546,24 +553,28 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 					return err
 				}
 
-				// If rendering drastically changed
-				if !strings.HasPrefix(newOutput, lastOutput) {
-					// Clear terminal and do a full re-render
-					fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-					fmt.Fprint(w, "\033[2J\033[H")
-					if _, err = fmt.Fprint(w, newOutput); err != nil {
-						return fmt.Errorf("unable to write to writer: %w", err)
-					}
-				} else {
-					// Get only the new part of the rendered output
-					newContent := strings.TrimPrefix(newOutput, lastOutput)
-					fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-					if _, err = fmt.Fprint(w, newContent); err != nil {
-						return fmt.Errorf("unable to write to writer: %w", err)
-					}
-				}
+				// Store the new output
+				finalOutput = newOutput
 
-				lastOutput = newOutput
+				// If we're using alternate screen, update it
+				if tb.isActive {
+					// If rendering drastically changed
+					if !strings.HasPrefix(newOutput, lastOutput) {
+						// Clear screen and do a full re-render in alternate buffer
+						tb.clear()
+						if err := tb.writeToAlt(newOutput); err != nil {
+							log.Debug("failed to write to alternate screen", "err", err)
+						}
+					} else {
+						// Get only the new part of the rendered output
+						newContent := strings.TrimPrefix(newOutput, lastOutput)
+						if err := tb.writeToAlt(newContent); err != nil {
+							log.Debug("failed to write to alternate screen", "err", err)
+						}
+					}
+
+					lastOutput = newOutput
+				}
 			}
 		} else if err := scanner.Err(); err != nil {
 			return fmt.Errorf("error reading from stdin: %w", err)
@@ -582,23 +593,27 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 					return err
 				}
 
-				if newOutput != lastOutput {
-					if !strings.HasPrefix(newOutput, lastOutput) {
-						// Full re-render
-						fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-						fmt.Fprint(w, "\033[2J\033[H")
-						if _, err = fmt.Fprint(w, newOutput); err != nil {
-							return fmt.Errorf("unable to write to writer: %w", err)
+				// Store the final output
+				finalOutput = newOutput
+
+				// Update the alternate screen if active
+				if tb.isActive {
+					if newOutput != lastOutput {
+						if !strings.HasPrefix(newOutput, lastOutput) {
+							// Full re-render in alternate buffer
+							tb.clear()
+							if err := tb.writeToAlt(newOutput); err != nil {
+								log.Debug("failed to write to alternate screen", "err", err)
+							}
+						} else {
+							// Incremental update
+							newContent := strings.TrimPrefix(newOutput, lastOutput)
+							if err := tb.writeToAlt(newContent); err != nil {
+								log.Debug("failed to write to alternate screen", "err", err)
+							}
 						}
-					} else {
-						// Incremental update
-						newContent := strings.TrimPrefix(newOutput, lastOutput)
-						fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-						if _, err = fmt.Fprint(w, newContent); err != nil {
-							return fmt.Errorf("unable to write to writer: %w", err)
-						}
+						lastOutput = newOutput
 					}
-					lastOutput = newOutput
 				}
 			}
 		default:
@@ -612,22 +627,12 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 		return err
 	}
 
-	if newOutput != lastOutput {
-		if !strings.HasPrefix(newOutput, lastOutput) {
-			// Full re-render
-			fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-			fmt.Fprint(w, "\033[2J\033[H")
-			if _, err = fmt.Fprint(w, newOutput); err != nil {
-				return fmt.Errorf("unable to write to writer: %w", err)
-			}
-		} else {
-			// Incremental update
-			newContent := strings.TrimPrefix(newOutput, lastOutput)
-			fmt.Fprint(w, "\r\033[K") // Clear current line (for loader)
-			if _, err = fmt.Fprint(w, newContent); err != nil {
-				return fmt.Errorf("unable to write to writer: %w", err)
-			}
-		}
+	// Store the final output
+	finalOutput = newOutput
+
+	// Exit alternate screen and output the final render to normal screen
+	if err := tb.finalOutput(finalOutput); err != nil {
+		return fmt.Errorf("failed to output final content: %w", err)
 	}
 
 	return nil
