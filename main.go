@@ -47,14 +47,18 @@ var (
 	showLineNumbers  bool
 	preserveNewLines bool
 	mouse            bool
-	loaderStyle      string
+	spinnerName      string
+	spinnerColorStr  string
+
+	spinnerFlags struct {
+		duration time.Duration
+		autoQuit bool
+	}
 
 	rootCmd = &cobra.Command{
-		Use:   "glow [SOURCE|DIR]",
-		Short: "Render markdown on the CLI, with pizzazz!",
-		Long: paragraph(
-			fmt.Sprintf("\nRender markdown on the CLI, %s!", keyword("with pizzazz")),
-		),
+		Use:              "glow [SOURCE|DIR]",
+		Short:            "Render markdown on the CLI",
+		Long:             paragraph("\nRender markdown on the CLI"),
 		SilenceErrors:    false,
 		SilenceUsage:     true,
 		TraverseChildren: true,
@@ -66,6 +70,32 @@ var (
 			return validateOptions(cmd)
 		},
 		RunE: execute,
+	}
+
+	spinnerCmd = &cobra.Command{
+		Use:   "spinner [TYPE]",
+		Short: "Preview available spinner animations",
+		Long:  paragraph(fmt.Sprintf("\n%s the available spinner animations for use with the --spinner flag.", keyword("Preview"))),
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// If a spinner type is specified as an argument, demonstrate it
+			if len(args) > 0 {
+				return demonstrateSpinner(args[0], spinnerColorStr)
+			}
+
+			// Otherwise show the spinner gallery
+			return showSpinnerGallery()
+		},
+	}
+
+	spinnerAllCmd = &cobra.Command{
+		Use:   "all",
+		Short: "Demonstrate all spinners sequentially",
+		Long:  paragraph("Show animations of all available spinners one after another."),
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return demonstrateAllSpinners(spinnerColorStr)
+		},
 	}
 )
 
@@ -203,13 +233,14 @@ func validateOptions(cmd *cobra.Command) error {
 			}
 
 			if width > 120 {
-				width = 120
+				width = width / 2
 			}
 		}
 		if width == 0 {
 			width = 80
 		}
 	}
+
 	return nil
 }
 
@@ -419,7 +450,7 @@ func shouldRenderUpdate(currentLine string, previousLines []string) bool {
 }
 
 func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
-	useLoader := loaderStyle != "none"
+	useSpinner := spinnerName != "none"
 
 	// If not reading from stdin, just read all and render once
 	if _, ok := src.reader.(*os.File); !ok || src.reader != os.Stdin {
@@ -441,12 +472,12 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 	}
 
 	// For stdin from a pipe, we'll read incrementally and render as we go
-	return renderIncrementalFromStdin(cmd, src, w, useLoader)
+	return renderIncrementalFromStdin(cmd, src, w, useSpinner)
 }
 
 // renderIncrementalFromStdin reads incrementally from stdin and renders
 // the markdown as it becomes available, using the alternate screen for progress
-func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, useLoader bool) error {
+func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, useSpinner bool) error {
 	// Create a terminal buffer manager
 	tb := newTermbuf(w)
 
@@ -474,25 +505,22 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 	var r *glamour.TermRenderer
 	var err error
 
-	// Setup loader if enabled and we're in alternate screen
-	var l *loader
-	if useLoader && tb.isActive {
-		// Choose loader type based on terminal capabilities or user preference
-		var loaderType loaderType
+	// Setup spinner if enabled and we're in alternate screen
+	var sp *Spinner
+	if useSpinner && tb.isActive {
+		// Get spinner type based on user preference
+		spinnerType := GetSpinnerType(spinnerName)
 
-		switch loaderStyle {
-		case "dots":
-			loaderType = loaderDots
-		case "braille":
-			loaderType = loaderBraille
-		default:
-			loaderType = loaderBraille
+		// Create and start the spinner
+		sp = NewSpinner(spinnerType)
+
+		// Set custom color if provided
+		if spinnerColorStr != "" {
+			sp.SetColor(spinnerColorStr)
 		}
 
-		// Create and start the loader
-		l = newLoader(loaderType)
-		l.start(w)
-		defer l.stop()
+		sp.Start(w)
+		defer sp.Stop()
 	}
 
 	// Setup renderer once
@@ -527,10 +555,10 @@ func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer, us
 		// Check if scanner has more data available
 		hasMore := scanner.Scan()
 		if hasMore {
-			// Update activity timestamp and loader
+			// Update activity timestamp and spinner
 			lastActivity = time.Now()
-			if l != nil {
-				l.update()
+			if sp != nil {
+				sp.Update()
 			}
 
 			// Get the new line
@@ -806,6 +834,10 @@ func init() {
 	rootCmd.Version = Version
 	rootCmd.InitDefaultCompletionCmd()
 
+	spinnerCmd.Flags().DurationVarP(&spinnerFlags.duration, "duration", "d", 0, "run spinner for a specific duration then exit")
+	spinnerCmd.Flags().BoolVarP(&spinnerFlags.autoQuit, "auto-quit", "q", false, "automatically quit after showing all frames once")
+	spinnerCmd.AddCommand(spinnerAllCmd)
+
 	// "Glow Classic" cli arguments
 	rootCmd.PersistentFlags().StringVar(&configFile, "config", "", fmt.Sprintf("config file (default %s)", viper.GetViper().ConfigFileUsed()))
 	rootCmd.Flags().BoolVarP(&pager, "pager", "p", false, "display with pager")
@@ -816,7 +848,8 @@ func init() {
 	rootCmd.Flags().BoolVarP(&showLineNumbers, "line-numbers", "l", false, "show line numbers (TUI-mode only)")
 	rootCmd.Flags().BoolVarP(&preserveNewLines, "preserve-new-lines", "n", false, "preserve newlines in the output")
 	rootCmd.Flags().BoolVarP(&mouse, "mouse", "m", false, "enable mouse wheel (TUI-mode only)")
-	rootCmd.Flags().StringVar(&loaderStyle, "loader", "braille", "loading animation style: braille, dots, none")
+	rootCmd.Flags().StringVar(&spinnerName, "spinner", "bouncingBall", "loading animation style: braille, dots, none")
+	rootCmd.Flags().StringVar(&spinnerColorStr, "spinner-color", "#FFFFFF", "color for spinner (any valid hex color like #FF0000)")
 	_ = rootCmd.Flags().MarkHidden("mouse")
 
 	// Config bindings
@@ -829,14 +862,16 @@ func init() {
 	_ = viper.BindPFlag("preserveNewLines", rootCmd.Flags().Lookup("preserve-new-lines"))
 	_ = viper.BindPFlag("showLineNumbers", rootCmd.Flags().Lookup("line-numbers"))
 	_ = viper.BindPFlag("all", rootCmd.Flags().Lookup("all"))
-	_ = viper.BindPFlag("loader", rootCmd.Flags().Lookup("loader"))
+	_ = viper.BindPFlag("spinner", rootCmd.Flags().Lookup("spinner"))
+	_ = viper.BindPFlag("spinnerColor", rootCmd.Flags().Lookup("spinner-color"))
 
 	viper.SetDefault("style", styles.AutoStyle)
 	viper.SetDefault("width", 0)
 	viper.SetDefault("all", true)
-	viper.SetDefault("loader", "braille")
+	viper.SetDefault("spinner", "braille")
+	viper.SetDefault("spinnerColor", "#FFFFFF")
 
-	rootCmd.AddCommand(configCmd, manCmd)
+	rootCmd.AddCommand(configCmd, manCmd, spinnerCmd)
 }
 
 func tryLoadConfigFromDefaultPlaces() {

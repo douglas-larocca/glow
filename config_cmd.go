@@ -20,9 +20,13 @@ mouse: false
 # use pager to display markdown
 pager: false
 # word-wrap at width
-width: 80
+width: 90
 # show all files, including hidden and ignored.
 all: false
+# spinner animation for streaming content (dots, dots2, line, star, boxBounce, etc.)
+spinner: "bouncingBall"
+# color for the spinner animation (any valid hex color)
+spinnerColor: "#ffffff"
 `
 
 var configCmd = &cobra.Command{
