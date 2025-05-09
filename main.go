@@ -2,6 +2,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/caarlos0/env/v11"
@@ -269,15 +272,179 @@ func executeArg(cmd *cobra.Command, arg string, w io.Writer) error {
 	return executeCLI(cmd, src, w)
 }
 
-func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
-	b, err := io.ReadAll(src.reader)
-	if err != nil {
-		return fmt.Errorf("unable to read from reader: %w", err)
+// shouldRenderUpdate determines if we should re-render based on the current line
+// and content seen so far. This helps identify markdown elements that can change
+// the rendering of previous content.
+func shouldRenderUpdate(currentLine string, previousLines []string) bool {
+	// Always render at least every 10 lines to ensure responsiveness
+	if len(previousLines)%10 == 0 {
+		return true
 	}
 
-	b = utils.RemoveFrontmatter(b)
+	// Check for constructs that can affect previous content rendering
+	patterns := []struct {
+		regex *regexp.Regexp
+		desc  string
+	}{
+		{regexp.MustCompile(`^\[.*?\]:\s+`), "reference link"},
+		{regexp.MustCompile(`^\[\^.*?\]:\s+`), "footnote definition"},
+		{regexp.MustCompile(`^<!--`), "HTML comment start"},
+		{regexp.MustCompile(`-->`), "HTML comment end"},
+		{regexp.MustCompile(`^#{1,6}\s+`), "heading"},
+		{regexp.MustCompile(`^(\*\s*){3,}`), "horizontal rule"},
+		{regexp.MustCompile(`^(\-\s*){3,}`), "horizontal rule"},
+		{regexp.MustCompile(`^(\_\s*){3,}`), "horizontal rule"},
+		{regexp.MustCompile(`^:::.*`), "fenced div start/end"},
+		{regexp.MustCompile(`^\|.*\|`), "table line"},
+		{regexp.MustCompile(`^(\s*\*\s+|\s*\d+\.\s+|\s*-\s+)`), "list item"},
+	}
 
-	// render
+	for _, pattern := range patterns {
+		if pattern.regex.MatchString(strings.TrimSpace(currentLine)) {
+			return true
+		}
+	}
+
+	// Check for the end of a code block which could affect rendering
+	if strings.TrimSpace(currentLine) == "```" {
+		// Look back to find if this is the end of a code block
+		for i := len(previousLines) - 2; i >= 0; i-- {
+			if strings.TrimSpace(previousLines[i]) == "```" {
+				return false // This is a nested ``` within a code block
+			}
+			if strings.HasPrefix(strings.TrimSpace(previousLines[i]), "```") {
+				return true // This is the end of a code block
+			}
+		}
+		return true // Assume it's the end of a code block if we can't determine
+	}
+
+	// Check for completion of a complex structure
+	if len(previousLines) >= 2 {
+		prevLine := strings.TrimSpace(previousLines[len(previousLines)-2])
+		// If we just completed a multi-line construct like a table
+		if (prevLine == "" && strings.HasPrefix(currentLine, "|")) ||
+			(strings.HasPrefix(prevLine, "|") && currentLine == "") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
+	// If not reading from stdin, just read all and render once
+	if _, ok := src.reader.(*os.File); !ok || src.reader != os.Stdin {
+		b, err := io.ReadAll(src.reader)
+		if err != nil {
+			return fmt.Errorf("unable to read from reader: %w", err)
+		}
+		return renderMarkdown(cmd, src, b, w)
+	}
+
+	// For stdin, check if it's a terminal or a pipe
+	if file, ok := src.reader.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		// If stdin is a terminal and not a pipe, just read all at once
+		b, err := io.ReadAll(src.reader)
+		if err != nil {
+			return fmt.Errorf("unable to read from reader: %w", err)
+		}
+		return renderMarkdown(cmd, src, b, w)
+	}
+
+	// For stdin from a pipe, we'll read incrementally and render as we go
+	return renderIncrementalFromStdin(cmd, src, w)
+}
+
+// renderIncrementalFromStdin reads incrementally from stdin and renders
+// the markdown as it becomes available
+func renderIncrementalFromStdin(cmd *cobra.Command, src *source, w io.Writer) error {
+	scanner := bufio.NewScanner(src.reader)
+
+	// Buffer to accumulate content
+	var buffer bytes.Buffer
+	var previousLines []string // Store individual lines for diffing
+	var lastOutput string      // Last output sent to terminal
+	var r *glamour.TermRenderer
+	var err error
+
+	// Setup renderer once
+	if r, _, err = setupRenderer(src); err != nil {
+		return err
+	}
+
+	for scanner.Scan() {
+		// Get the new line
+		line := scanner.Text()
+
+		// Add the line to our accumulated content
+		buffer.WriteString(line)
+		buffer.WriteString("\n")
+
+		// Add to our line-by-line tracking
+		previousLines = append(previousLines, line)
+
+		// Only re-render periodically or when we detect certain markdown structures
+		// that might affect previous rendering
+		shouldRender := shouldRenderUpdate(line, previousLines)
+
+		if shouldRender {
+			// Generate new full output
+			newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
+			if err != nil {
+				return err
+			}
+
+			// If rendering drastically changed (can happen with reference links, footnotes, etc.)
+			if !strings.HasPrefix(newOutput, lastOutput) {
+				// Clear terminal and do a full re-render if the output doesn't just append
+				fmt.Fprint(w, "\033[2J\033[H")
+				if _, err = fmt.Fprint(w, newOutput); err != nil {
+					return fmt.Errorf("unable to write to writer: %w", err)
+				}
+			} else {
+				// Get only the new part of the rendered output
+				newContent := strings.TrimPrefix(newOutput, lastOutput)
+				if _, err = fmt.Fprint(w, newContent); err != nil {
+					return fmt.Errorf("unable to write to writer: %w", err)
+				}
+			}
+
+			lastOutput = newOutput
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading from stdin: %w", err)
+	}
+
+	// Ensure final render happens if we stopped early due to periodic rendering
+	newOutput, err := renderContentIncremental(r, src, buffer.Bytes(), "")
+	if err != nil {
+		return err
+	}
+
+	if newOutput != lastOutput {
+		if !strings.HasPrefix(newOutput, lastOutput) {
+			// Full re-render
+			fmt.Fprint(w, "\033[2J\033[H")
+			if _, err = fmt.Fprint(w, newOutput); err != nil {
+				return fmt.Errorf("unable to write to writer: %w", err)
+			}
+		} else {
+			// Incremental update
+			newContent := strings.TrimPrefix(newOutput, lastOutput)
+			if _, err = fmt.Fprint(w, newContent); err != nil {
+				return fmt.Errorf("unable to write to writer: %w", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// setupRenderer creates a glamour renderer with proper configuration
+func setupRenderer(src *source) (*glamour.TermRenderer, string, error) {
 	var baseURL string
 	u, err := url.ParseRequestURI(src.URL)
 	if err == nil {
@@ -287,30 +454,82 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 
 	isCode := !utils.IsMarkdownFile(src.URL)
 
-	// initialize glamour
+	// Initialize glamour
 	r, err := glamour.NewTermRenderer(
 		glamour.WithColorProfile(lipgloss.ColorProfile()),
 		utils.GlamourStyle(style, isCode),
-		glamour.WithWordWrap(int(width)), //nolint:gosec
+		glamour.WithWordWrap(int(width)),
 		glamour.WithBaseURL(baseURL),
 		glamour.WithPreservedNewLines(),
 	)
 	if err != nil {
-		return fmt.Errorf("unable to create renderer: %w", err)
+		return nil, "", fmt.Errorf("unable to create renderer: %w", err)
 	}
 
-	content := string(b)
-	ext := filepath.Ext(src.URL)
+	return r, baseURL, nil
+}
+
+// renderContentIncremental renders the provided markdown content and returns the rendered output
+// This is used for incremental rendering to compare with previous output
+func renderContentIncremental(r *glamour.TermRenderer, src *source, content []byte, lastOutput string) (string, error) {
+	// Apply frontmatter removal
+	contentWithoutFrontmatter := utils.RemoveFrontmatter(content)
+
+	// Handle code files
+	contentStr := string(contentWithoutFrontmatter)
+	isCode := !utils.IsMarkdownFile(src.URL)
 	if isCode {
-		content = utils.WrapCodeBlock(string(b), ext)
+		contentStr = utils.WrapCodeBlock(contentStr, filepath.Ext(src.URL))
 	}
 
-	out, err := r.Render(content)
+	// Render the content
+	out, err := r.Render(contentStr)
+	if err != nil {
+		return "", fmt.Errorf("unable to render markdown: %w", err)
+	}
+
+	return out, nil
+}
+
+// renderContent renders the provided markdown content to the writer
+// This is used for one-time full rendering
+func renderContent(r *glamour.TermRenderer, src *source, content []byte, w io.Writer) error {
+	out, err := renderContentIncremental(r, src, content, "")
+	if err != nil {
+		return err
+	}
+
+	// Output the rendered content
+	if _, err = fmt.Fprint(w, out); err != nil {
+		return fmt.Errorf("unable to write to writer: %w", err)
+	}
+
+	return nil
+}
+
+// renderMarkdown handles the one-time rendering of markdown content (non-stdin case)
+func renderMarkdown(cmd *cobra.Command, src *source, content []byte, w io.Writer) error {
+	content = utils.RemoveFrontmatter(content)
+
+	// Setup renderer
+	r, _, err := setupRenderer(src)
+	if err != nil {
+		return err
+	}
+
+	// Render
+	contentStr := string(content)
+	isCode := !utils.IsMarkdownFile(src.URL)
+	if isCode {
+		contentStr = utils.WrapCodeBlock(contentStr, filepath.Ext(src.URL))
+	}
+
+	out, err := r.Render(contentStr)
 	if err != nil {
 		return fmt.Errorf("unable to render markdown: %w", err)
 	}
 
-	// display
+	// Display
 	switch {
 	case pager || cmd.Flags().Changed("pager"):
 		pagerCmd := os.Getenv("PAGER")
@@ -319,7 +538,7 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 		}
 
 		pa := strings.Split(pagerCmd, " ")
-		c := exec.Command(pa[0], pa[1:]...) //nolint:gosec
+		c := exec.Command(pa[0], pa[1:]...)
 		c.Stdin = strings.NewReader(out)
 		c.Stdout = os.Stdout
 		if err := c.Run(); err != nil {
@@ -331,7 +550,7 @@ func executeCLI(cmd *cobra.Command, src *source, w io.Writer) error {
 		if !isURL(src.URL) {
 			path = src.URL
 		}
-		return runTUI(path, content)
+		return runTUI(path, contentStr)
 	default:
 		if _, err = fmt.Fprint(w, out); err != nil {
 			return fmt.Errorf("unable to write to writer: %w", err)
